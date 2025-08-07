@@ -156,11 +156,28 @@ class BacktestConfig:
 
 
 @dataclass
+class Trade:
+    trade_id: str
+    entry_timestamp: str
+    exit_timestamp: str | None
+    entry_price: float
+    exit_price: float | None
+    instrument: str
+    side: str  # "SELL" for short positions
+    quantity: int
+    entry_reason: str
+    exit_reason: str | None
+    trade_pnl: float | None
+    cumulative_pnl: float | None
+    status: str  # "OPEN", "CLOSED"
+
+@dataclass
 class DailyResult:
     date: datetime
     gross_premium: float
     net_pnl: float
     leg_hit: str | None  # "CE", "PE", or None (both alive till EOD)
+    trades: list[Trade]
 
 
 class BankNiftyCSVBacktester:
@@ -170,6 +187,8 @@ class BankNiftyCSVBacktester:
         self.csv_folder = Path(csv_folder)
         self.cfg = cfg or BacktestConfig()
         self.results: list[DailyResult] = []
+        self.all_trades: list[Trade] = []  # Store all trades across all days
+        self.cumulative_pnl = 0.0  # Running total across all trades
 
     # ──────────────────────────────────────────────────────────────────────
     def run(self):
@@ -177,13 +196,18 @@ class BankNiftyCSVBacktester:
         csv_files = sorted(self.csv_folder.glob("GFDLNFO_BACKADJUSTED_*.csv"))
         if not csv_files:
             warnings.warn("No GFDLNFO_BACKADJUSTED_*.csv files found in the specified directory")
-            return pd.DataFrame()
+            return pd.DataFrame(), pd.DataFrame()
         for file in tqdm(csv_files, desc="Back‑testing days"):
             self._run_one_day(file)
-        return pd.DataFrame([r.__dict__ for r in self.results])
+        
+        # Generate summary and detailed reports
+        summary_df = pd.DataFrame([r.__dict__ for r in self.results])
+        trades_df = pd.DataFrame([t.__dict__ for t in self.all_trades])
+        return summary_df, trades_df
 
     # ──────────────────────────────────────────────────────────────────────
     def _run_one_day(self, file_path: Path):
+        """Process one day of data and track individual trades."""
         df = pd.read_csv(file_path)
 
         # Parse the ticker to extract symbol, strike, and option type
@@ -252,6 +276,45 @@ class BankNiftyCSVBacktester:
             warnings.warn(f"Missing option prices at entry for {file_path.name}")
             return
         gross_credit = ce_entry + pe_entry
+        
+        # Create entry trades
+        date_str = file_path.stem[-8:]
+        ce_instrument = f"BANKNIFTY{date_str}{int(atm_strike)}CE"
+        pe_instrument = f"BANKNIFTY{date_str}{int(atm_strike)}PE"
+        
+        # Track individual trades
+        day_trades = []
+        ce_trade = Trade(
+            trade_id=f"{date_str}_CE_{len(self.all_trades)+1}",
+            entry_timestamp=f"{date_str} {entry_ts}",
+            exit_timestamp=None,
+            entry_price=ce_entry,
+            exit_price=None,
+            instrument=ce_instrument,
+            side="SELL",
+            quantity=1,
+            entry_reason="Strategy Entry - Short Straddle",
+            exit_reason=None,
+            trade_pnl=None,
+            cumulative_pnl=None,
+            status="OPEN"
+        )
+        pe_trade = Trade(
+            trade_id=f"{date_str}_PE_{len(self.all_trades)+2}",
+            entry_timestamp=f"{date_str} {entry_ts}",
+            exit_timestamp=None,
+            entry_price=pe_entry,
+            exit_price=None,
+            instrument=pe_instrument,
+            side="SELL",
+            quantity=1,
+            entry_reason="Strategy Entry - Short Straddle",
+            exit_reason=None,
+            trade_pnl=None,
+            cumulative_pnl=None,
+            status="OPEN"
+        )
+        day_trades.extend([ce_trade, pe_trade])
 
         # Stop‑loss levels
         ce_sl = ce_entry * (1 + self.cfg.individual_sl_pct)
@@ -360,12 +423,42 @@ class BankNiftyCSVBacktester:
         if ce_alive or pe_alive:
             day_pnl = (ce_entry - ce_exit) + (pe_entry - pe_exit)
 
+        # Update trade exit information and calculate P&L
+        ce_pnl = ce_entry - ce_exit
+        pe_pnl = pe_entry - pe_exit
+        day_pnl = ce_pnl + pe_pnl
+        
+        # Update CE trade
+        ce_trade.exit_timestamp = f"{date_str} {exit_ts if not ce_alive else exit_ts}"
+        ce_trade.exit_price = ce_exit
+        ce_trade.trade_pnl = ce_pnl
+        ce_trade.status = "CLOSED"
+        ce_trade.exit_reason = leg_hit if leg_hit in ['CE', 'Combined'] else "EOD Exit"
+        
+        # Update PE trade
+        pe_trade.exit_timestamp = f"{date_str} {exit_ts if not pe_alive else exit_ts}"
+        pe_trade.exit_price = pe_exit
+        pe_trade.trade_pnl = pe_pnl
+        pe_trade.status = "CLOSED"
+        pe_trade.exit_reason = leg_hit if leg_hit in ['PE', 'Combined'] else "EOD Exit"
+        
+        # Update cumulative P&L
+        self.cumulative_pnl += ce_pnl
+        ce_trade.cumulative_pnl = self.cumulative_pnl
+        
+        self.cumulative_pnl += pe_pnl
+        pe_trade.cumulative_pnl = self.cumulative_pnl
+        
+        # Add trades to all_trades list
+        self.all_trades.extend(day_trades)
+        
         self.results.append(
             DailyResult(
                 date=datetime.strptime(file_path.stem[-8:], "%d%m%Y"),
                 gross_premium=gross_credit,
                 net_pnl=day_pnl,
                 leg_hit=leg_hit,
+                trades=day_trades
             )
         )
 
@@ -408,9 +501,32 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     bt = BankNiftyCSVBacktester(args.csv_dir)
-    df_results = bt.run()
-    print("\nSummary:")
-    print(df_results["net_pnl"].describe())
-    out = Path(args.csv_dir) / "backtest_results.csv"
-    df_results.to_csv(out, index=False)
-    print(f"Saved per‑day results → {out}")
+    summary_df, trades_df = bt.run()
+    
+    if len(summary_df) == 0:
+        print("No results generated.")
+        exit(1)
+    
+    print("\nDaily Summary:")
+    print(summary_df["net_pnl"].describe())
+    
+    print("\nDetailed Trade Report:")
+    print(f"Total Trades: {len(trades_df)}")
+    print(f"Total P&L: {trades_df['trade_pnl'].sum():.2f}")
+    print(f"Final Cumulative P&L: {trades_df['cumulative_pnl'].iloc[-1]:.2f}")
+    print(f"Win Rate: {(trades_df['trade_pnl'] > 0).mean()*100:.1f}%")
+    
+    # Save reports
+    summary_out = Path(args.csv_dir) / "backtest_summary.csv"
+    trades_out = Path(args.csv_dir) / "backtest_trades.csv"
+    
+    summary_df.to_csv(summary_out, index=False)
+    trades_df.to_csv(trades_out, index=False)
+    
+    print(f"\nSaved daily summary → {summary_out}")
+    print(f"Saved detailed trades → {trades_out}")
+    
+    # Display sample trades
+    print("\nSample Trade Details:")
+    print(trades_df[['trade_id', 'entry_timestamp', 'exit_timestamp', 'instrument', 
+                     'entry_price', 'exit_price', 'exit_reason', 'trade_pnl', 'cumulative_pnl']].head(10).to_string(index=False))
