@@ -1,0 +1,281 @@
+STRATEGY "Aseem_BNF_SuperTrend_Straddle" VERSION 1.0 {
+
+// ===== PARAMETERS (Aseem's Strategy Configuration) =====
+PARAMS {
+  UNDERLYING         = Index("BANKNIFTY");
+  EXPIRY_KIND        = Weekly;              // Thursday weekly expiry
+  ENTRY_TIME         = "09:19:00";          // Entry after opening volatility
+  EXIT_TIME          = "15:15:00";          // Exit before market close
+  TF                 = 3m;                  // 3-minute timeframe for SuperTrend
+  ST_LENGTH          = 10;                  // SuperTrend period
+  ST_MULTIPLIER      = 3;                   // SuperTrend multiplier
+  LOTS               = 15;                  // Bank Nifty standard lot size
+  INDIVIDUAL_SL_PCT  = 15%;                 // Individual leg stop-loss
+  COMBINED_SL_PCT    = 25%;                 // Combined position stop-loss
+  TRAILING_SL_PCT    = 10%;                 // Trailing stop after one leg exits
+  STRIKE_ROUNDING    = 100;                 // Round ATM strike to nearest 100
+  ORDER_TYPE         = MARKET;              // Market orders for immediate fills
+  LIVE_MODE          = Paper;               // Backtest|Paper|Live
+  BROKER             = "AngelOne";          // AngelOne SmartAPI integration
+  SLIPPAGE_BPS       = 5;                   // Slippage in basis points
+  FEES_PER_LOT       = 40 INR;              // Round-turn transaction costs
+  MAX_DAILY_LOSS     = 50000 INR;           // Daily loss limit
+  TZ                 = "Asia/Kolkata";      // IST timezone
+}
+
+// ===== ENVIRONMENT SETUP =====
+SET {
+  Timezone(TZ);
+  MarketCalendar = NSE;                       // NSE calendar with holidays
+  Mode           = LIVE_MODE;                 
+  Broker         = BROKER;
+  RiskLimits {
+    MaxDailyLoss     = MAX_DAILY_LOSS;        // Kill switch on daily loss
+    MaxNetPositions  = 2 legs;                // Only 1 CE + 1 PE allowed
+    MaxOrderRetries  = 3;                     // Order retry attempts
+  }
+  Accounting {
+    Slippage(bps = SLIPPAGE_BPS);
+    FeesPerLot  = FEES_PER_LOT;
+    TrackPnL    = Realtime;                   // Real-time P&L tracking
+  }
+}
+
+// ===== PRECOMPUTE INDICATORS =====
+LET bnfSpot = Spot(UNDERLYING);
+LET bars3m  = Candle(UNDERLYING, interval = TF);
+LET ST      = SuperTrend(bars3m, length = ST_LENGTH, multiplier = ST_MULTIPLIER);
+
+// ===== DAILY ENTRY LOGIC =====
+SCHEDULE Daily WHEN TradingDay AND NOT Holiday {
+  AT ENTRY_TIME {
+    // Calculate ATM strike (rounded to nearest 100)
+    LET spotPrice  = LAST(bnfSpot);
+    LET atmStrike  = ROUND(spotPrice, nearest = STRIKE_ROUNDING);
+    
+    // Get weekly expiry options at ATM strike
+    LET atmCE = Option(
+      underlying = UNDERLYING, 
+      expiry = Nearest(EXPIRY_KIND), 
+      strike = atmStrike,
+      type = "CE"
+    );
+    
+    LET atmPE = Option(
+      underlying = UNDERLYING, 
+      expiry = Nearest(EXPIRY_KIND), 
+      strike = atmStrike,
+      type = "PE"
+    );
+    
+    // Verify lot size (should be 15 for Bank Nifty)
+    LET QTY = LOTS;
+    ASSERT LotSize(atmCE) == 15 ELSE WARN "Non-standard lot size detected";
+    
+    // Execute short straddle entry
+    entryCE = SELL(atmCE, qty = QTY, order_type = ORDER_TYPE);
+    entryPE = SELL(atmPE, qty = QTY, order_type = ORDER_TYPE);
+    
+    // Record entry premiums for stop-loss calculations
+    LET cePremium = entryCE.FillPrice;
+    LET pePremium = entryPE.FillPrice;
+    LET totalPremium = (cePremium + pePremium) * QTY;
+    
+    NOTE "Straddle entered: CE@{cePremium}, PE@{pePremium}, Strike: {atmStrike}";
+    
+    // Set individual stop-losses (15% of respective premiums)
+    LET ceSL = cePremium * (1 + INDIVIDUAL_SL_PCT);
+    LET peSL = pePremium * (1 + INDIVIDUAL_SL_PCT);
+    
+    ATTACH STOP(entryCE, price = ceSL, label = "CE_IndividualSL");
+    ATTACH STOP(entryPE, price = peSL, label = "PE_IndividualSL");
+    
+    // Activate combined stop-loss monitor (25% of total premium)
+    LET combinedSLThreshold = totalPremium * COMBINED_SL_PCT;
+    
+    WATCH "CombinedSL" EVERY 1s {
+      LET currentCE = IF entryCE.IsOpen THEN MarketPrice(atmCE) ELSE 0;
+      LET currentPE = IF entryPE.IsOpen THEN MarketPrice(atmPE) ELSE 0;
+      LET currentTotal = (currentCE + currentPE) * QTY;
+      LET loss = currentTotal - totalPremium;
+      
+      IF loss >= combinedSLThreshold {
+        NOTE "Combined SL triggered: Loss {loss} >= {combinedSLThreshold}";
+        EXIT ALL USING MARKET;
+        HALT STRATEGY FOR TODAY;
+      }
+    }
+    
+    // Store initial values for trailing logic
+    STORE initialCEPremium = cePremium;
+    STORE initialPEPremium = pePremium;
+    STORE remainingLeg = null;
+    
+    // Switch to 3-minute context for SuperTrend analysis
+    CONTEXT Timeframe = TF;
+  }
+}
+
+// ===== INDIVIDUAL STOP-LOSS HIT - ACTIVATE TRAILING =====
+ON FIRST_OF(entryCE.Stopped, entryPE.Stopped) AS firstStop {
+  // Identify and store the remaining leg
+  LET stoppedLeg = firstStop.Position;
+  LET remaining = IF stoppedLeg == entryCE THEN entryPE ELSE entryCE;
+  STORE remainingLeg = remaining;
+  
+  // Disable combined SL (only one leg remains)
+  DISABLE WATCH "CombinedSL";
+  
+  NOTE "Individual SL hit on {stoppedLeg.Symbol}. Managing remaining leg with trailing SL.";
+  
+  // Get current SuperTrend value
+  LET lastBar = LAST(bars3m);
+  LET stValue = ST.Value AT lastBar.EndTime;
+  LET spotPrice = lastBar.Close;
+  
+  // Calculate initial trailing stop (10% above entry premium)
+  LET remainingPremium = remaining.EntryPrice;
+  LET trailingSL = remainingPremium * (1 + TRAILING_SL_PCT);
+  
+  // Attach trailing stop-loss that follows SuperTrend
+  ATTACH TRAILING_STOP(remaining,
+    initial = trailingSL,
+    label = "SuperTrend_Trail"
+  );
+  
+  // Monitor SuperTrend for dynamic trailing adjustments
+  ON BAR_CLOSE(bars3m) {
+    IF remaining.IsOpen {
+      LET currentBar = LAST(bars3m);
+      LET currentST = ST.Value;
+      LET currentSpot = currentBar.Close;
+      
+      // Exit if spot crosses above SuperTrend (trend reversal)
+      IF currentSpot > currentST {
+        NOTE "SuperTrend exit signal: Spot {currentSpot} > ST {currentST}";
+        EXIT remaining USING MARKET;
+        HALT STRATEGY FOR TODAY;
+      }
+      
+      // Tighten trailing stop based on favorable movement
+      ELSE {
+        LET optionPrice = MarketPrice(remaining.Instrument);
+        LET newTrail = MIN(optionPrice * (1 + TRAILING_SL_PCT), remaining.TrailingStop);
+        
+        IF newTrail < remaining.TrailingStop {
+          UPDATE TRAILING_STOP(remaining, price = newTrail);
+          NOTE "Trail tightened to {newTrail}";
+        }
+      }
+    }
+  }
+}
+
+// ===== TIME-BASED EXIT =====
+SCHEDULE Daily WHEN TradingDay AND NOT Holiday {
+  AT EXIT_TIME {
+    IF AnyOpenPositions {
+      NOTE "End-of-day exit at {EXIT_TIME}";
+      EXIT ALL USING MARKET;
+    }
+    
+    // Log daily performance
+    LET dailyPnL = Account.DailyPnL;
+    LET tradesCount = Account.DailyTradeCount;
+    NOTE "Daily Summary: PnL={dailyPnL}, Trades={tradesCount}";
+    
+    HALT STRATEGY FOR TODAY;
+  }
+}
+
+// ===== RISK MANAGEMENT & SAFETY =====
+RUNTIME {
+  // Daily loss limit kill switch
+  ON Account.DailyLoss >= MAX_DAILY_LOSS {
+    NOTE "EMERGENCY: Max daily loss {MAX_DAILY_LOSS} reached!";
+    EXIT ALL USING MARKET IMMEDIATE;
+    DISABLE STRATEGY UNTIL NextTradingDay;
+    ALERT Email("Risk limit breached - Strategy disabled");
+  }
+  
+  // Handle connection issues
+  ON Disconnect {
+    NOTE "Connection lost - attempting reconnect...";
+    RECONNECT WITH Backoff(exponential, max = 30s);
+    IF Failed AFTER 5 attempts {
+      EXIT ALL USING MARKET;
+      ALERT SMS("Strategy disconnected - positions closed");
+    }
+  }
+  
+  // Order management policies
+  Orders {
+    Retry(count = 3, backoff = Exponential);
+    PartialFillHandling = WaitForComplete;     // Wait for full fills
+    RejectionHandling = RetryWithMarket;       // Use market on rejection
+    DuplicatePrevention = true;
+    TimeInForce = DAY;                         // Day orders only
+  }
+  
+  // Live trading specific settings
+  IF Mode == Live {
+    RequireAuthentication = true;              // TOTP authentication
+    LogLevel = VERBOSE;                        // Detailed logging
+    RecordExecutions = true;                   // Save all trades
+    EnableDryRun = false;                      // Real trading
+    
+    // AngelOne specific configuration
+    BrokerConfig {
+      API = "SmartAPI";
+      WebSocket = true;                        // Real-time data
+      SubscribeDepth = false;                  // No depth needed
+      HeartbeatInterval = 30s;                 // Keep-alive
+    }
+  }
+}
+
+// ===== MONITORING & ALERTS =====
+MONITOR {
+  // Track key metrics
+  METRIC "Win Rate" = WinningTrades / TotalTrades;
+  METRIC "Avg Win" = AverageWin;
+  METRIC "Avg Loss" = AverageLoss;
+  METRIC "Max Drawdown" = MaxDrawdown;
+  
+  // Alert on anomalies
+  ALERT IF "Win Rate" < 0.40 THEN Email("Low win rate detected");
+  ALERT IF "Max Drawdown" > 30000 INR THEN SMS("High drawdown warning");
+  
+  // Performance reporting
+  REPORT Daily AT "16:00:00" {
+    Include Trades, PnL, Metrics;
+    SendTo Email("trading@example.com");
+    Store CSV("reports/daily_{DATE}.csv");
+  }
+}
+
+// ===== BACKTESTING CONFIGURATION =====
+BACKTEST {
+  Period = "2024-01-01" TO "2024-12-31";
+  InitialCapital = 500000 INR;
+  DataSource = "TrueData";                     // Historical data provider
+  IncludeTransactionCosts = true;
+  IncludeSlippage = true;
+  
+  // Realistic execution simulation
+  ExecutionModel {
+    FillPrice = MidPoint;                      // Mid of bid-ask
+    Latency = 100ms;                           // Network delay
+    PartialFills = Possible;                   // Realistic fills
+  }
+  
+  // Output configuration
+  Output {
+    Format = JSON;
+    SaveTo = "backtest_results/aseem_strategy_{TIMESTAMP}.json";
+    GenerateChart = true;
+    PlotIndicators = [ST, "Entry Points", "Exit Points"];
+  }
+}
+
+}
