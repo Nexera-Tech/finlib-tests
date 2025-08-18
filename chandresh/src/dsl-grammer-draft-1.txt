@@ -1,0 +1,144 @@
+STRATEGY "BNF_ATM_ST_Trail_v1" VERSION 1.0 {
+
+// ===== PARAMETERS (tweak without touching logic) =====
+PARAMS {
+  UNDERLYING         = Index("BANKNIFTY");
+  EXPIRY_KIND        = Weekly;              // Weekly expiry
+  ENTRY_TIME         = "09:19:00";          // changeable per need
+  EXIT_TIME          = "15:15:00";
+  TF                 = 3m;                  // analysis timeframe for ST & exits
+  ST_LENGTH          = 10;                  // SuperTrend length
+  ST_MULTIPLIER      = 3;                   // SuperTrend multiplier
+  LOTS               = 1;                   // # of lots (broker lot-size is applied)
+  INDIVIDUAL_SL_PCT  = 15%;                 // per-leg initial SL
+  COMBINED_SL_PCT    = 25%;                 // combined SL on net credit
+  ORDER_TYPE         = MARKET;              // MARKET|LIMIT (entry)
+  LIVE_MODE          = Paper;               // Backtest|Paper|Live
+  BROKER             = "Dhan";              // "Dhan"|"Zerodha"|...
+  SLIPPAGE_BPS       = 5;                   // backtest/live sim slippage (per fill)
+  FEES_PER_LOT       = 20 INR;              // round-turn fees (backtest accounting)
+  MAX_DAILY_DRAWDOWN = 2% of AccountEquity; // kill-switch guardrail
+  TZ                 = "Asia/Kolkata";
+}
+
+// ===== ENVIRONMENT & SAFETY =====
+SET {
+  Timezone(TZ);
+  MarketCalendar = NSE;                       // includes holidays/early closes
+  Mode           = LIVE_MODE;                 // Backtest/Paper/Live
+  Broker         = BROKER;
+  RiskLimits {
+    MaxDailyDrawdown = MAX_DAILY_DRAWDOWN;    // auto EXIT ALL & DISABLE if breached
+    MaxNetPositions  = 2 legs;
+  }
+  Accounting {
+    Slippage(bps = SLIPPAGE_BPS);
+    FeesPerLot  = FEES_PER_LOT;
+  }
+}
+
+// ===== PRECOMPUTE SERIES & INDICATORS (3m) =====
+LET bars3m = Candle(UNDERLYING, interval = TF);
+LET ST     = SuperTrend(bars3m, length = ST_LENGTH, multiplier = ST_MULTIPLIER);
+
+// ===== ENTRY SCHEDULE =====
+SCHEDULE Daily WHEN TradingDay AND NOT Holiday {
+  AT ENTRY_TIME {
+    // Resolve nearest-expiry ATM strikes at the moment of entry
+    LET atmCE = Option(underlying = UNDERLYING, expiry = Nearest(EXPIRY_KIND), moneyness = "ATM", type = "CE", at = NOW);
+    LET atmPE = Option(underlying = UNDERLYING, expiry = Nearest(EXPIRY_KIND), moneyness = "ATM", type = "PE", at = NOW);
+
+    // Normalize quantity to broker lot size
+    LET QTY = LOTS * LotSize(atmCE);   // CE/PE share the same lot size on index
+
+    // Enter short straddle (sell both legs) at market by default
+    entryCE = SELL(atmCE, qty = QTY, order_type = ORDER_TYPE);
+    entryPE = SELL(atmPE, qty = QTY, order_type = ORDER_TYPE);
+
+    // Record initial net credit for combined SL logic
+    LET credit_CE = entryCE.FillPrice * QTY;
+    LET credit_PE = entryPE.FillPrice * QTY;
+    LET NET_CREDIT = credit_CE + credit_PE;
+
+    // Attach initial per-leg SL (15% of its own premium) — engine-managed if broker lacks OCO
+    ATTACH STOP(entryCE, kind = PercentOfEntry, value = INDIVIDUAL_SL_PCT);
+    ATTACH STOP(entryPE, kind = PercentOfEntry, value = INDIVIDUAL_SL_PCT);
+
+    // Activate combined SL watcher (25% of initial net credit loss)
+    WATCH "CombinedSL" WHEN ( (-(entryCE.PnL + entryPE.PnL)) >= COMBINED_SL_PCT * NET_CREDIT ) {
+      NOTE "Combined SL hit (≥ {COMBINED_SL_PCT} of net credit). Exiting all legs.";
+      EXIT ALL USING MARKET;
+      HALT STRATEGY FOR TODAY;  // block re-entries
+    }
+
+    // Switch analysis to 3m regime for subsequent logic
+    CONTEXT Timeframe = TF;
+  }
+}
+
+// ===== POST-FIRST-SL REGIME (leg management) =====
+ON FIRST_OF(entryCE.Stopped, entryPE.Stopped) AS firstStop {
+  // Identify which leg remains
+  LET remaining = IF entryCE.Stopped THEN entryPE ELSE entryCE;
+
+  // Combined SL no longer meaningful with a single leg — disable it safely
+  DISABLE WATCH "CombinedSL";
+
+  // Evaluate SuperTrend regime at the close of the most recent 3m bar
+  LET lastBar   = LAST(bars3m);
+  LET uClose    = lastBar.Close;
+  LET stValue   = ST.Value AT lastBar.EndTime;
+
+  IF uClose > stValue {
+    // Case (a): Close > ST → keep remaining SL at 25% of ITS entry premium (fixed)
+    REPLACE STOP(remaining, kind = PercentOfEntry, value = 25%);
+    NOTE "Remaining leg keeps fixed 25% SL (Close > ST)";
+  } ELSE {
+    // Case (b): Close < ST → start trailing SL for the remaining leg
+    // Trailing policy: follow the SuperTrend line; exit on close>ST cross
+    ATTACH TRAILING_STOP(remaining,
+      driver = ST,                    // underlying ST as the trailing driver
+      map = UnderlyingToOption,       // engine maps underlying levels to option SL via live delta
+      mode = FollowLine,              // keep stop at or above ST-implied level (never loosen)
+      floor = 15% of EntryPrice       // never trail looser than initial 15%
+    );
+    NOTE "Remaining leg now trailing with SuperTrend(10,3) on 3m (Close ≤ ST)";
+  }
+
+  // Regardless of the branch, whenever Close > ST on 3m bars, exit the remaining leg
+  ON BAR_CLOSE(bars3m) WHEN (bars3m.Close > ST.Value) {
+    IF remaining.IsOpen {
+      NOTE "Close > SuperTrend on 3m — exiting remaining leg.";
+      EXIT remaining USING MARKET;
+    }
+  }
+}
+
+// ===== TIME-BASED EXIT FAILSAFE =====
+SCHEDULE Daily WHEN TradingDay AND NOT Holiday {
+  AT EXIT_TIME {
+    IF AnyOpenPositions {
+      NOTE "Time-based exit at {EXIT_TIME}.";
+      EXIT ALL USING MARKET;
+    }
+    HALT STRATEGY FOR TODAY;
+  }
+}
+
+// ===== LIVE OPS SAFETY (applies only in Paper/Live) =====
+RUNTIME {
+  // Kill-switch if daily drawdown breached
+  ON Risk.DailyDrawdown >= MAX_DAILY_DRAWDOWN {
+    NOTE "Max daily drawdown reached — flattening & disabling.";
+    EXIT ALL USING MARKET;
+    DISABLE STRATEGY UNTIL NextTradingDay;
+  }
+
+  // Connectivity/order re-try policies for live
+  Orders {
+    Retry(count = 3, backoff = Exponential);
+    PartialFillHandling = ContinueMonitoring;  // stops trail even with partials
+    ProtectAgainstDuplicateSignals = true;
+  }
+}
+}

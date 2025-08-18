@@ -1,0 +1,29 @@
+# Core data processing
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Lean Algorithm Framework (for Lean strategies)
+# Note: Lean is typically run in Docker containers
+# For local development, you can use the Python stubs
+# lean>=1.0.0
+
+# Nautilus Trader (for Nautilus strategies)
+# nautilus-trader>=1.180.0
+
+# Backtesting and analysis
+# backtrader>=1.9.76
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Optional: Jupyter for notebook analysis
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
+# Development tools
+pytest>=7.0.0
+black>=22.0.0
+flake8>=4.0.0
+
+# Financial data
+yfinance>=0.1.70
+ta-lib>=0.4.24  # Technical analysis library
